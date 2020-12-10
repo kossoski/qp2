@@ -5,13 +5,13 @@ subroutine svd(A,LDA,U,LDU,D,Vt,LDVt,m,n)
   !
   ! LDx : leftmost dimension of x
   !
-  ! Dimsneion of A is m x n
+  ! Dimension of A is m x n
   !
   END_DOC
 
   integer, intent(in)             :: LDA, LDU, LDVt, m, n
   double precision, intent(in)    :: A(LDA,n)
-  double precision, intent(out)   :: U(LDU,m)
+  double precision, intent(out)   :: U(LDU,min(m,n))
   double precision,intent(out)    :: Vt(LDVt,n)
   double precision,intent(out)    :: D(min(m,n))
   double precision,allocatable    :: work(:)
@@ -19,7 +19,7 @@ subroutine svd(A,LDA,U,LDU,D,Vt,LDVt,m,n)
 
   double precision,allocatable    :: A_tmp(:,:)
   allocate (A_tmp(LDA,n))
-  A_tmp = A
+  A_tmp(:,:) = A(:,:)
 
   ! Find optimal size for temp arrays
   allocate(work(1))
@@ -33,15 +33,305 @@ subroutine svd(A,LDA,U,LDU,D,Vt,LDVt,m,n)
   allocate(work(lwork))
   call dgesvd('A','A', m, n, A_tmp, LDA,                             &
       D, U, LDU, Vt, LDVt, work, lwork, info)
-  deallocate(work,A_tmp)
+  deallocate(A_tmp,work)
 
   if (info /= 0) then
     print *,  info, ': SVD failed'
     stop
   endif
 
+  do j=1,m
+    do i=1,m
+      if (dabs(U(i,j)) < 1.d-14)  U(i,j) = 0.d0
+    enddo
+  enddo
+
+  do j=1,n
+    do i=1,n
+      if (dabs(Vt(i,j)) < 1.d-14) Vt(i,j) = 0.d0
+    enddo
+  enddo
+
 end
 
+subroutine svd_symm(A,LDA,U,LDU,D,Vt,LDVt,m,n)
+  implicit none
+  BEGIN_DOC
+  ! Compute A = U.D.Vt
+  !
+  ! LDx : leftmost dimension of x
+  !
+  ! Dimension of A is m x n
+  !
+  END_DOC
+
+  integer, intent(in)             :: LDA, LDU, LDVt, m, n
+  double precision, intent(in)    :: A(LDA,n)
+  double precision, intent(out)   :: U(LDU,min(m,n))
+  double precision,intent(out)    :: Vt(LDVt,n)
+  double precision,intent(out)    :: D(min(m,n))
+  double precision,allocatable    :: work(:)
+  integer                         :: info, lwork, i, j, k
+
+  double precision,allocatable    :: A_tmp(:,:)
+  allocate (A_tmp(LDA,n))
+  A_tmp(:,:) = A(:,:)
+
+  ! Find optimal size for temp arrays
+  allocate(work(1))
+  lwork = -1
+  call dgesvd('A','A', m, n, A_tmp, LDA,                             &
+      D, U, LDU, Vt, LDVt, work, lwork, info)
+  ! /!\ int(WORK(1)) becomes negative when WORK(1) > 2147483648
+  lwork = max(int(work(1)), 5*MIN(M,N))
+  deallocate(work)
+
+  allocate(work(lwork))
+  call dgesvd('A','A', m, n, A_tmp, LDA,                             &
+      D, U, LDU, Vt, LDVt, work, lwork, info)
+  deallocate(A_tmp,work)
+
+  if (info /= 0) then
+    print *,  info, ': SVD failed'
+    stop
+  endif
+
+  ! Iterative refinement
+  ! --------------------
+  ! https://doi.org/10.1016/j.cam.2019.112512
+
+  integer :: iter
+  double precision,allocatable    :: R(:,:), S(:,:), T(:,:)
+  double precision,allocatable    :: sigma(:), F(:,:), G(:,:)
+  double precision :: alpha, beta, x, thresh
+
+  allocate (R(m,m), S(n,n), T(m,n), sigma(m), F(m,m), G(n,n), A_tmp(m,n))
+  sigma = 0.d0
+  R = 0.d0
+  S = 0.d0
+  T = 0.d0
+  F = 0.d0
+  G = 0.d0
+
+  thresh = 1.d-8
+  call restore_symmetry(m,m,U,size(U,1),thresh)
+  call restore_symmetry(n,n,Vt,size(Vt,1),thresh)
+
+  do iter=1,4
+    do k=1,n
+      A_tmp(1:m,k) = D(k) * U(1:m,k)
+    enddo
+
+    call dgemm('N','N',m,n,n,1.d0,A_tmp,size(A_tmp,1), &
+       Vt,size(Vt,1),0.d0,R,size(R,1))
+
+    print *, maxval(dabs(R(1:m,1:n) - A(1:m,1:n)))
+
+
+    call dgemm('T','N',m,m,m,-1.d0,U,size(U,1), &
+      U,size(U,1),0.d0,R,size(R,1))
+    do i=1,m
+      R(i,i) = R(i,i) + 1.d0
+    enddo
+
+    call dgemm('N','T',n,n,n,-1.d0,Vt,size(Vt,1), &
+      Vt,size(Vt,1),0.d0,S,size(S,1))
+    do i=1,n
+      S(i,i) = S(i,i) + 1.d0
+    enddo
+
+
+    call dgemm('T','N',m,n,m,1.d0,U,size(U,1), &
+       A,size(A,1),0.d0,A_tmp,size(A_tmp,1))
+
+    call dgemm('N','T',m,n,n,1.d0,A_tmp,size(A_tmp,1), &
+       Vt,size(Vt,1),0.d0,T,size(T,1))
+
+
+    do i=1,n
+      sigma(i) = T(i,i)/(1.d0 - (R(i,i)+S(i,i))*0.5d0)
+      F(i,i) = 0.5d0*R(i,i)
+      G(i,i) = 0.5d0*S(i,i)
+    enddo
+
+    do j=1,n
+      do i=1,n
+        if (i == j) cycle
+        alpha = T(i,j) + sigma(j) * R(i,j)
+        beta  = T(i,j) + sigma(j) * S(i,j)
+        x = 1.d0 / (sigma(j)*sigma(j) - sigma(i)*sigma(i))
+        F(i,j) = (alpha * sigma(j) + beta * sigma(i)) * x
+        G(i,j) = (alpha * sigma(i) + beta * sigma(j)) * x
+      enddo
+    enddo
+
+    do i=1,n
+      x = 1.d0/sigma(i)
+      do j=n+1,m
+        F(i,j) = -T(j,i) * x
+      enddo
+    enddo
+
+    do i=n+1,m
+      do j=1,n
+        F(i,j) = R(i,j) - F(j,i)
+      enddo
+    enddo
+
+    do i=n+1,m
+      do j=n+1,m
+        F(i,j) = R(i,j)*0.5d0
+      enddo
+    enddo
+
+    D(1:min(n,m)) = sigma(1:min(n,m))
+    call dgemm('N','N',m,m,m,1.d0,U,size(U,1),F,size(F,1), &
+       0.d0, A_tmp, size(A_tmp,1))
+    do j=1,m
+      do i=1,m
+        U(i,j) = U(i,j) + A_tmp(i,j)
+      enddo
+    enddo
+
+    call dgemm('T','N',n,n,n,1.d0,G,size(G,1),Vt,size(Vt,1), &
+       0.d0, A_tmp, size(A_tmp,1))
+    do j=1,n
+      do i=1,n
+        Vt(i,j) = Vt(i,j) + A_tmp(i,j)
+      enddo
+    enddo
+
+    thresh = 0.01d0 * thresh
+    call restore_symmetry(m,m,U,size(U,1),thresh)
+    call restore_symmetry(n,n,Vt,size(Vt,1),thresh)
+
+  enddo
+
+  deallocate(A_tmp,R,S,F,G,sigma)
+end
+
+subroutine eigSVD(A,LDA,U,LDU,D,Vt,LDVt,m,n)
+  implicit none
+  BEGIN_DOC
+! Algorithm 3 of https://arxiv.org/pdf/1810.06860.pdf
+!
+! A(m,n) = U(m,n) D(n) Vt(n,n) with m>n
+  END_DOC
+  integer, intent(in)            :: LDA, LDU, LDVt, m, n
+  double precision, intent(in)   :: A(LDA,n)
+  double precision, intent(out)  :: U(LDU,n)
+  double precision,intent(out)   :: Vt(LDVt,n)
+  double precision,intent(out)   :: D(n)
+
+  integer                        :: i,j,k
+
+  if (m<n) then
+    stop -1
+    call svd(A,LDA,U,LDU,D,Vt,LDVt,m,n)
+    return
+  endif
+
+  double precision, allocatable :: B(:,:), V(:,:)
+  allocate(B(n,n))
+  ! B = - At . A
+  call dgemm('T','N',n,n,m,-1.d0,A,size(A,1),A,size(A,1),0.d0,B,size(B,1))
+
+  ! V, D = eig(B)
+  allocate(V(n,n))
+  call lapack_diagd(D,V,B,n,n)
+  deallocate(B)
+  do j=1,n
+   do i=1,n
+     Vt(i,j) = V(j,i)
+   enddo
+  enddo
+
+  ! S = sqrt(-D)
+  ! U = A.V.S^-1
+  ! U = A.(S^-1.vt)t
+
+  do k=1,n
+    if (D(k) >= 0.d0) then
+      exit
+    endif
+    D(k) = dsqrt(-D(k))
+    call dscal(n, 1.d0/D(k), V(1,k), 1)
+  enddo
+  D(k:n) = 0.d0
+  k=k-1
+  call dgemm('N','N',m,n,k,1.d0,A,size(A,1),V,size(V,1),0.d0,U,size(U,1))
+
+end
+
+
+subroutine randomized_svd(A,LDA,U,LDU,D,Vt,LDVt,m,n,q,r)
+  implicit none
+  include 'constants.include.F'
+  BEGIN_DOC
+! Randomized SVD: rank r, q power iterations
+!
+! 1. Sample column space of A with P: Z = A.P where P is random with r+p columns.
+!
+! 2. Power iterations : Z <- X . (Xt.Z)
+!
+! 3. Z = Q.R
+!
+! 4. Compute SVD on projected Qt.X = U' . S. Vt
+!
+! 5. U = Q U'
+  END_DOC
+
+  integer, intent(in)             :: LDA, LDU, LDVt, m, n, q, r
+  double precision, intent(in)    :: A(LDA,n)
+  double precision, intent(out)   :: U(LDU,r)
+  double precision,intent(out)    :: Vt(LDVt,r)
+  double precision,intent(out)    :: D(r)
+  integer                         :: i, j, k
+
+  double precision,allocatable    :: Z(:,:), P(:,:), Y(:,:), UY(:,:)
+  double precision :: r1,r2
+  allocate(P(n,r), Z(m,r))
+
+  ! P is a normal random matrix (n,r)
+  do k=1,r
+    do i=1,n
+      call random_number(r1)
+      call random_number(r2)
+      r1 = dsqrt(-2.d0*dlog(r1))
+      r2 = dtwo_pi*r2
+      P(i,k) = r1*dcos(r2)
+    enddo
+  enddo
+
+  ! Z(m,r) = A(m,n).P(n,r)
+  call dgemm('N','N',m,r,n,1.d0,A,size(A,1),P,size(P,1),0.d0,Z,size(Z,1))
+
+  ! Power iterations
+  do k=1,q
+    ! P(n,r) = At(n,m).Z(m,r)
+    call dgemm('T','N',n,r,m,1.d0,A,size(A,1),Z,size(Z,1),0.d0,P,size(P,1))
+    ! Z(m,r) = A(m,n).P(n,r)
+    call dgemm('N','N',m,r,n,1.d0,A,size(A,1),P,size(P,1),0.d0,Z,size(Z,1))
+  enddo
+
+  deallocate(P)
+
+  ! QR factorization of Z
+  call ortho_svd(Z,size(Z,1),m,r)
+
+  allocate(Y(r,n), UY(r,r))
+  ! Y(r,n) = Zt(r,m).A(m,n)
+  call dgemm('T','N',r,n,m,1.d0,Z,size(Z,1),A,size(A,1),0.d0,Y,size(Y,1))
+
+  ! SVD of Y
+  call svd(Y,size(Y,1),UY,size(UY,1),D,Vt,size(Vt,1),r,n)
+  deallocate(Y)
+
+  ! U(m,r) = Z(m,r).UY(r,r)
+  call dgemm('N','N',m,r,r,1.d0,Z,size(Z,1),UY,size(UY,1),0.d0,U,size(U,1))
+  deallocate(UY,Z)
+
+end
 
 subroutine svd_complex(A,LDA,U,LDU,D,Vt,LDVt,m,n)
   implicit none
@@ -807,6 +1097,33 @@ subroutine ortho_canonical(overlap,LDA,N,C,LDC,m,cutoff)
 end
 
 
+subroutine ortho_svd(A,LDA,m,n)
+  implicit none
+  BEGIN_DOC
+  ! Orthogonalization via fast SVD
+  !
+  ! A : matrix to orthogonalize
+  !
+  ! LDA : leftmost dimension of A
+  !
+  ! m : Number of rows of A
+  !
+  ! n : Number of columns of A
+  !
+  END_DOC
+  integer, intent(in)            :: m,n, LDA
+  double precision, intent(inout) :: A(LDA,n)
+  if (m < n) then
+    call ortho_qr(A,LDA,m,n)
+  endif
+  double precision, allocatable :: U(:,:), D(:), Vt(:,:)
+  allocate(U(m,n), D(n), Vt(n,n))
+  call SVD(A,LDA,U,size(U,1),D,Vt,size(Vt,1),m,n)
+  A(1:m,1:n) = U(1:m,1:n)
+  deallocate(U,D, Vt)
+
+end
+
 subroutine ortho_qr(A,LDA,m,n)
   implicit none
   BEGIN_DOC
@@ -1218,3 +1535,108 @@ subroutine lapack_diag(eigvalues,eigvectors,H,nmax,n)
   deallocate(A,eigenvalues)
 end
 
+subroutine nullify_small_elements(m,n,A,LDA,thresh)
+  implicit none
+  integer, intent(in) :: m,n,LDA
+  double precision, intent(inout) :: A(LDA,n)
+  double precision, intent(in) :: thresh
+  integer :: i,j
+  double precision :: amax
+
+  ! Find max value
+  amax = 0.d0
+  do j=1,n
+    do i=1,m
+      amax = max(dabs(A(i,j)), amax)
+    enddo
+  enddo
+  if (amax == 0.d0) return
+  amax = 1.d0/amax
+
+  ! Remove tiny elements
+  do j=1,n
+    do i=1,m
+      if ( dabs(A(i,j) * amax) < thresh ) then
+         A(i,j) = 0.d0
+      endif
+    enddo
+  enddo
+
+end
+
+subroutine restore_symmetry(m,n,A,LDA,thresh)
+  implicit none
+  BEGIN_DOC
+! Tries to find the matrix elements that are the same, and sets them
+! to the average value.
+! If restore_symm is False, only nullify small elements
+  END_DOC
+  integer, intent(in) :: m,n,LDA
+  double precision, intent(inout) :: A(LDA,n)
+  double precision, intent(in) :: thresh
+  integer :: i,j,k,l
+  logical, allocatable :: done(:,:)
+  double precision :: f, g, count, thresh2
+  thresh2 = dsqrt(thresh)
+  call nullify_small_elements(m,n,A,LDA,thresh)
+
+  if (.not.restore_symm) then
+    return
+  endif
+
+  ! TODO:  Costs O(n^4), but can be improved to (2 n^2 * log(n)):
+  ! - copy all values in a 1D array
+  ! - sort 1D array
+  ! - average nearby elements 
+  ! - for all elements, find matching value in the sorted 1D array
+
+  allocate(done(m,n))
+
+  do j=1,n
+    do i=1,m
+      done(i,j) = A(i,j) == 0.d0
+    enddo
+  enddo
+
+  do j=1,n
+    do i=1,m
+      if ( done(i,j) ) cycle
+      done(i,j) = .True.
+      count = 1.d0
+      f = 1.d0/A(i,j)
+      do l=1,n
+        do k=1,m
+          if ( done(k,l) ) cycle
+          g = f * A(k,l)
+          if ( dabs(dabs(g) - 1.d0) < thresh2 ) then
+            count = count + 1.d0
+            if (g>0.d0) then
+              A(i,j) = A(i,j) + A(k,l)
+            else
+              A(i,j) = A(i,j) - A(k,l)
+            end if
+          endif
+        enddo
+      enddo
+      if (count > 1.d0) then
+        A(i,j) = A(i,j) / count
+        do l=1,n
+          do k=1,m
+            if ( done(k,l) ) cycle
+            g = f * A(k,l)
+            if ( dabs(dabs(g) - 1.d0) < thresh2 ) then
+              done(k,l) = .True.
+              if (g>0.d0) then
+                A(k,l) = A(i,j)
+              else
+                A(k,l) = -A(i,j)
+              end if
+            endif
+          enddo
+        enddo
+      endif
+
+    enddo
+  enddo
+
+end

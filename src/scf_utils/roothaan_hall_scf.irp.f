@@ -62,7 +62,7 @@ END_DOC
 
     dim_DIIS = min(dim_DIIS+1,max_dim_DIIS)
 
-    if (scf_algorithm == 'DIIS') then
+    if ( (scf_algorithm == 'DIIS').and.(dabs(Delta_energy_SCF) > 1.d-6) )  then
 
       ! Store Fock and error matrices at each iteration
       do j=1,ao_num
@@ -153,7 +153,7 @@ END_DOC
   enddo
 
  if (iteration_SCF < n_it_SCF_max) then
-   mo_label = "Canonical"
+   mo_label = 'Canonical'
  endif
 !
 ! End of Main SCF loop
@@ -164,7 +164,10 @@ END_DOC
   write(6,*)
 
   if(.not.frozen_orb_scf)then
-   call mo_as_eigvectors_of_mo_matrix(Fock_matrix_mo,size(Fock_matrix_mo,1),size(Fock_matrix_mo,2),mo_label,1,.true.)
+   call mo_as_eigvectors_of_mo_matrix(Fock_matrix_mo,size(Fock_matrix_mo,1), &
+      size(Fock_matrix_mo,2),mo_label,1,.true.)
+   call restore_symmetry(ao_num, mo_num, mo_coef, size(mo_coef,1), 1.d-10)
+   call orthonormalize_mos
    call save_mos
   endif
 
